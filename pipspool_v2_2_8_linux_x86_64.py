@@ -961,6 +961,79 @@ class OrcaProfiles:
 
     def parent_for(self, vendor: str, material: str) -> str:
         material_key = material.strip().casefold()
+        material_text = material.strip()
+        vendor_key = vendor.strip()
+
+        # Prefer Orca's live preset bundle. Recent Orca builds store
+        # system presets in .opc files rather than individual JSON files.
+        try:
+            collection = orca.host.preset_bundle().filaments
+            names = {
+                str(name).strip().casefold(): str(name)
+                for name in collection.preset_names()
+            }
+
+            # Build the same material-type index used by the JSON fallback,
+            # but from Orca's live system presets.
+            live_presets_by_type: dict[str, list[str]] = {}
+            live_type_names: dict[str, str] = {}
+            for name in collection.preset_names():
+                preset = collection.find_preset(name)
+                if preset is None or not preset.is_system:
+                    continue
+                types_serialized = preset.config_value("filament_type")
+                if not isinstance(types_serialized, str):
+                    continue
+                for value in types_serialized.split(";"):
+                    type_name = value.strip()
+                    type_key = type_name.casefold()
+                    if type_key:
+                        live_presets_by_type.setdefault(type_key, []).append(str(name))
+                        live_type_names.setdefault(type_key, type_name)
+
+            # First choice: vendor-specific exact system preset.
+            if vendor_key:
+                vendor_parent = f"{vendor_key} {material_text} @System"
+                found = names.get(vendor_parent.casefold())
+                if found:
+                    return found
+
+            # Second choice: generic exact system preset.
+            generic_parent = f"Generic {material_text} @System"
+            found = names.get(generic_parent.casefold())
+            if found:
+                return found
+
+            # Preserve the existing compatible-material logic: choose the
+            # longest material type that is a complete prefix of the material.
+            compatible_types = [
+                type_key for type_key in live_presets_by_type
+                if material_key.startswith(type_key)
+                and len(material_key) > len(type_key)
+                and not material_key[len(type_key)].isalnum()
+            ]
+            if compatible_types:
+                compatible_type = max(compatible_types, key=len)
+                type_name = live_type_names[compatible_type]
+
+                # Third choice: vendor-specific compatible material type.
+                if vendor_key:
+                    vendor_parent = f"{vendor_key} {type_name} @System"
+                    found = names.get(vendor_parent.casefold())
+                    if found:
+                        return found
+
+                # Fourth choice: generic compatible material type.
+                generic_parent = f"Generic {type_name} @System"
+                found = names.get(generic_parent.casefold())
+                if found:
+                    return found
+
+        except Exception as exc:
+            log(f"[ORCA PARENT PRESET] {exc}")
+
+        # Fallback for older Orca builds where system presets are
+        # available as JSON files.
         presets_by_type: dict[str, list[str]] = {}
         for name, preset in self.system_presets.items():
             types = preset.get("filament_type") or []
@@ -983,6 +1056,7 @@ class OrcaProfiles:
             if compatible_types:
                 parent_type = max(compatible_types, key=len)
                 matching = presets_by_type[parent_type]
+
         if not matching:
             parent_type = "pla"
             matching = presets_by_type.get(parent_type, [])
@@ -991,11 +1065,11 @@ class OrcaProfiles:
         for name in matching:
             if name.strip().casefold() == exact_generic:
                 return name
+
         # Never accept a printer-specific preset merely because its name begins
         # with "Generic PETG" (or another material). Orca hides children of that
         # parent whenever a different printer is active.
         return f"Generic {parent_type.upper()} @System"
-
     def effective_preset(self, preset: dict[str, Any]) -> dict[str, Any]:
         chain = []
         current = preset
@@ -1954,79 +2028,150 @@ def profile_sync_statuses(
     sync_state: dict[str, dict[str, str]] | None = None,
     inject_spool_id: bool = True,
 ) -> dict[int, dict[str, str]]:
-    """Compare active spools with disk without claiming Orca's live UI state."""
-    directories = profiles.user_filament_directories()
-    if not directories:
+    """Compare active Spoolman spools with Orca's actually loaded user presets."""
+
+    # Ask Orca which filament presets are actually loaded.
+    # This avoids guessing whether user\default or user\<UUID> is active.
+    active_files_by_id: dict[int, list[Path]] = {}
+
+    try:
+        bundle = orca.host.preset_bundle()
+        filaments = bundle.filaments
+
+        for index in range(filaments.size()):
+            preset = filaments.preset(index)
+
+            if not preset.is_user():
+                continue
+
+            if not preset.file:
+                continue
+
+            source = Path(preset.file)
+
+            # Only consider PipSpool-style filament profiles.
+            if not source.name.endswith(
+                (PROFILE_SUFFIX, " - Spoolman.json")
+            ):
+                continue
+
+            spool_id = spool_id_from_name(source.name)
+            if spool_id is None:
+                continue
+
+            active_files_by_id.setdefault(spool_id, []).append(source)
+
+    except Exception as exc:
+        log(f"[PROFILE STATUS] Could not inspect Orca loaded presets: {exc!r}")
         return {
             int(spool["id"]): {
                 "status": "error",
                 "warning": (
-                    "PipSpool could not find an Orca user filament directory. "
+                    "PipSpool could not inspect Orca's loaded filament presets. "
                     "Check the PipSpool log for details."
                 ),
             }
-            for spool in spools if spool.get("id") is not None
+            for spool in spools
+            if spool.get("id") is not None
         }
-
-    indexed: list[dict[int, list[Path]]] = []
-    for directory in directories:
-        files_by_id: dict[int, list[Path]] = {}
-        if directory.is_dir():
-            for path in directory.glob("*.json"):
-                spool_id = spool_id_from_name(path.name)
-                if spool_id is not None and path.name.endswith(
-                    (PROFILE_SUFFIX, " - Spoolman.json")
-                ):
-                    files_by_id.setdefault(spool_id, []).append(path)
-        indexed.append(files_by_id)
 
     result: dict[int, dict[str, str]] = {}
     sync_state = sync_state if isinstance(sync_state, dict) else {}
+
     for spool in spools:
         if spool.get("id") is None:
             continue
+
         spool_id = int(spool["id"])
+        candidates = sorted(active_files_by_id.get(spool_id, []))
+
+        if not candidates:
+            result[spool_id] = {
+                "status": "profile_missing",
+                "warning": (
+                    f"The active Orca profile for spool #{spool_id} is missing. "
+                    "Select Synchronize now, then restart OrcaSlicer."
+                ),
+            }
+            continue
+
         missing = False
         update_required = False
         comparison_error = False
-        for directory, files_by_id in zip(directories, indexed):
-            candidates = sorted(files_by_id.get(spool_id, []))
-            if not candidates:
-                missing = True
-                continue
-            source = candidates[0]
+
+        # Orca normally has exactly one active user preset for a given spool.
+        # Keep the duplicate detection from the old implementation.
+        if len(candidates) > 1:
+            update_required = True
+
+        for source in candidates:
+            directory = source.parent
+
             try:
                 raw = json.loads(source.read_text(encoding="utf-8"))
+
                 if not isinstance(raw, dict):
                     raise ValueError("profile root is not an object")
+
                 display_name, desired = desired_preset(
-                    spool, raw, profiles, selected_settings, inject_spool_id
+                    spool,
+                    raw,
+                    profiles,
+                    selected_settings,
+                    inject_spool_id,
                 )
+
                 target = directory / f"{safe_filename(display_name)}.json"
-                if source != target or len(candidates) > 1 or raw != desired:
+                raw_for_compare = dict(raw)
+                desired_for_compare = dict(desired)
+
+                if "filament_cost" in raw_for_compare and "filament_cost" in desired_for_compare:
+                    try:
+                        raw_for_compare["filament_cost"] = [
+                            f"{float(value):.2f}"
+                            for value in raw_for_compare["filament_cost"]
+                        ]
+                        desired_for_compare["filament_cost"] = [
+                            f"{float(value):.2f}"
+                            for value in desired_for_compare["filament_cost"]
+                        ]
+                    except (TypeError, ValueError):
+                        pass
+
+                if source != target or raw_for_compare != desired_for_compare:
                     update_required = True
                 filament = spool.get("filament") or {}
                 baseline = sync_state.get(str(filament.get("id")), {})
                 extras = filament.get("extra") or {}
                 effective = profiles.effective_preset(raw)
+
                 for setting in selected_settings:
                     agreed = baseline.get(setting)
+
                     if agreed is None or setting not in effective:
                         continue
+
                     orca_value = encode_spoolman_setting_value(
-                        setting, effective.get(setting)
+                        setting,
+                        effective.get(setting),
                     )
+
                     spoolman_value = encode_spoolman_setting_value(
                         setting,
-                        decode_extra_value(extras.get(orca_extra_key(setting))),
+                        decode_extra_value(
+                            extras.get(orca_extra_key(setting))
+                        ),
                     )
+
                     if (
                         orca_value == agreed
                         and spoolman_value is not None
                         and spoolman_value != agreed
                     ):
                         update_required = True
+
                         break
+
             except (OSError, ValueError, TypeError):
                 comparison_error = True
 
@@ -2034,33 +2179,19 @@ def profile_sync_statuses(
             result[spool_id] = {
                 "status": "error",
                 "warning": (
-                    f"PipSpool could not read or compare the Orca profile for "
-                    f"spool #{spool_id}. Synchronize again and check the PipSpool "
-                    "log if the problem remains."
+                    f"PipSpool could not read or compare the active Orca profile "
+                    f"for spool #{spool_id}. Synchronize again and check the "
+                    "PipSpool log if the problem remains."
                 ),
             }
         elif missing:
             result[spool_id] = {
                 "status": "profile_missing",
                 "warning": (
-                    f"The Orca profile for spool #{spool_id} is missing. Select "
-                    "Synchronize now, then restart OrcaSlicer."
-                ),
-            }
-        elif update_required:
-            result[spool_id] = {
-                "status": "update_required",
-                "warning": (
-                    f"The Orca profile for spool #{spool_id} needs synchronization. "
+                    f"The active Orca profile for spool #{spool_id} is missing. "
                     "Select Synchronize now, then restart OrcaSlicer."
                 ),
-            }
-        else:
-            result[spool_id] = {"status": "synced", "warning": ""}
-    return result
-
-
-def page_spool_data(
+            def page_spool_data(
     spool: dict[str, Any], sync_status: dict[str, str] | None = None
 ) -> dict[str, Any]:
     filament = spool.get("filament") or {}
